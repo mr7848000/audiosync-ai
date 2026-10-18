@@ -12,7 +12,7 @@ import imageio_ffmpeg
 # ---------------- CONFIG ----------------
 
 TRANSCRIPTION_MODEL = "whisper-large-v3"
-ALIGNMENT_MODEL = "llama-3.3-70b-versatile"
+ALIGNMENT_MODEL = "openai/gpt-oss-20b"
 
 API_KEY = os.environ.get("GROQ_API_KEY")
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
