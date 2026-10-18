@@ -1,111 +1,66 @@
 import os
 import re
 import json
-import shutil
-import subprocess
 import tempfile
+import subprocess
 from pathlib import Path
 
 import gradio as gr
 import imageio_ffmpeg
 from groq import Groq
 
-# ---------------- CONFIGURATION ----------------
-
 MODEL = "whisper-large-v3"
-MAX_FILE_MB = 24
-
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 API_KEY = os.environ.get("GROQ_API_KEY")
 
-# ---------------- AUDIO UTILITIES ----------------
 
 def run_ffmpeg(args):
-    command = [FFMPEG, "-y"] + args
     result = subprocess.run(
-        command,
+        [FFMPEG, "-y"] + args,
         capture_output=True,
         text=True,
         timeout=600
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            result.stderr[-2000:] or "FFmpeg failed."
-        )
+        raise RuntimeError(result.stderr[-1500:])
 
 
-def get_duration(path):
+def duration(path):
     result = subprocess.run(
-        [
-            FFMPEG,
-            "-i", path,
-            "-f", "null",
-            "-"
-        ],
+        [FFMPEG, "-i", path, "-f", "null", "-"],
         capture_output=True,
         text=True,
         timeout=120
     )
-
-    output = result.stderr
-
     match = re.search(
         r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)",
-        output
+        result.stderr
     )
-
     if not match:
-        raise RuntimeError("Could not determine audio duration.")
+        raise RuntimeError("Audio duration could not be read.")
+    h, m, s = match.groups()
+    return int(h) * 3600 + int(m) * 60 + float(s)
 
-    hours, minutes, seconds = match.groups()
 
-    return (
-        int(hours) * 3600
-        + int(minutes) * 60
-        + float(seconds)
+def transcribe(client, path, language):
+    wav = os.path.join(
+        tempfile.gettempdir(),
+        next(tempfile._get_candidate_names()) + ".wav"
     )
-
-
-def convert_to_wav(source, destination):
-    run_ffmpeg([
-        "-i", source,
-        "-vn",
-        "-ac", "1",
-        "-ar", "16000",
-        "-c:a", "pcm_s16le",
-        destination
-    ])
-
-
-def split_sentences(text):
-    text = text.strip()
-
-    if not text:
-        return []
-
-    parts = re.split(r"(?<=[.!?।])\s+", text)
-
-    return [p.strip() for p in parts if p.strip()]
-
-
-# ---------------- SPEECH RECOGNITION ----------------
-
-def transcribe_audio(client, path, language):
-    wav_path = str(Path(path).with_suffix(".wav"))
-    convert_to_wav(path, wav_path)
-
     try:
-        size_mb = os.path.getsize(wav_path) / (1024 * 1024)
+        run_ffmpeg([
+            "-i", path, "-vn", "-ac", "1",
+            "-ar", "16000", "-c:a", "pcm_s16le", wav
+        ])
 
-        if size_mb > MAX_FILE_MB:
+        if os.path.getsize(wav) > 24 * 1024 * 1024:
             raise RuntimeError(
-                "Converted audio exceeds the API file-size limit. "
-                "Please use a shorter audio file."
+                "Converted file exceeds the API size limit."
             )
 
-        with open(wav_path, "rb") as audio_file:
+        with open(wav, "rb") as audio:
             response = client.audio.transcriptions.create(
-                file=(Path(wav_path).name, audio_file),
+                file=(Path(wav).name, audio),
                 model=MODEL,
                 language=language,
                 response_format="verbose_json",
@@ -113,341 +68,187 @@ def transcribe_audio(client, path, language):
             )
 
         words = []
-
         for item in (getattr(response, "words", None) or []):
-            words.append({
-    "word": item.get("word") if isinstance(item, dict) else item.word,
-    "start": float(item.get("start") if isinstance(item, dict) else item.start),
-    "end": float(item.get("end") if isinstance(item, dict) else item.end)
-})
+            if isinstance(item, dict):
+                word = item.get("word", "")
+                start = item.get("start", 0)
+                end = item.get("end", 0)
+            else:
+                word = item.word
+                start = item.start
+                end = item.end
 
-        return {
-            "text": response.text,
-            "words": words,
-            "duration": get_duration(path)
-        }
+            words.append({
+                "word": str(word),
+                "start": float(start),
+                "end": float(end)
+            })
+
+        if not words:
+            raise RuntimeError(
+                "The transcription API returned no word timestamps."
+            )
+
+        return words
 
     finally:
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
+        if os.path.exists(wav):
+            os.remove(wav)
 
 
-# ---------------- ALIGNMENT HELPERS ----------------
-
-def normalize(text):
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def split_words_by_script(words, script):
-    """
-    Approximate script alignment using recognized word order.
-    This is not a guaranteed forced aligner.
-    """
-
-    sentences = split_sentences(script)
-
-    if not sentences:
-        raise ValueError("A script is empty.")
-
-    if not words:
-        raise ValueError(
-            "Word timestamps were not returned by the API."
+def tempo_filter(speed):
+    if speed < 0.5 or speed > 2.0:
+        raise RuntimeError(
+            "A speech segment needs an extreme speed change. "
+            "The automatic match is uncertain."
         )
 
-    script_tokens = [
-        len(normalize(sentence).split())
-        for sentence in sentences
-    ]
-
-    total_tokens = sum(script_tokens)
-
-    if total_tokens == 0:
-        raise ValueError("Could not read the script.")
-
-    result = []
-    cursor = 0
-    total_words = len(words)
-
-    for index, sentence in enumerate(sentences):
-        if index == len(sentences) - 1:
-            end_cursor = total_words
-        else:
-            proportion = sum(script_tokens[:index + 1]) / total_tokens
-            end_cursor = round(proportion * total_words)
-
-        end_cursor = max(cursor + 1, end_cursor)
-        end_cursor = min(end_cursor, total_words)
-
-        group = words[cursor:end_cursor]
-
-        if not group:
-            continue
-
-        result.append({
-            "sentence": sentence,
-            "start": float(group[0]["start"]),
-            "end": float(group[-1]["end"])
-        })
-
-        cursor = end_cursor
-
-    return result
+    return f"atempo={speed:.6f}"
 
 
-def build_tempo_filter(source_duration, target_duration):
-    """
-    FFmpeg atempo preserves pitch reasonably well.
-    Extreme speed changes are intentionally rejected.
-    """
-
-    if source_duration <= 0 or target_duration <= 0:
-        raise ValueError("Invalid sentence duration.")
-
-    speed = source_duration / target_duration
-
-    if speed < 0.40 or speed > 2.50:
-        raise ValueError(
-            "Sentence timing is too different. "
-            "The sentence mapping needs correction."
-        )
-
-    filters = []
-
-    while speed > 2.0:
-        filters.append("atempo=2.0")
-        speed /= 2.0
-
-    while speed < 0.5:
-        filters.append("atempo=0.5")
-        speed /= 0.5
-
-    filters.append(f"atempo={speed:.6f}")
-
-    return ",".join(filters)
-
-
-# ---------------- MAIN PROCESSING ----------------
-
-def synchronize(
-    english_audio,
-    hindi_audio,
-    english_script,
-    hindi_script
-):
+def synchronize(english_audio, hindi_audio):
     if not API_KEY:
-        raise gr.Error(
-            "GROQ_API_KEY is missing. Add it in Render Environment."
-        )
+        raise gr.Error("GROQ_API_KEY is missing in Render Environment.")
 
-    if not all([
-        english_audio,
-        hindi_audio,
-        english_script,
-        hindi_script
-    ]):
-        raise gr.Error("Upload both audios and both scripts.")
+    if not english_audio or not hindi_audio:
+        raise gr.Error("Upload both English and Hindi audio files.")
 
     client = Groq(api_key=API_KEY)
-
-    temp_dir = tempfile.mkdtemp(prefix="audiosync_")
+    work = tempfile.mkdtemp(prefix="audiosync_")
 
     try:
-        english_data = transcribe_audio(
-            client,
-            english_audio,
-            "en"
-        )
+        en_words = transcribe(client, english_audio, "en")
+        hi_words = transcribe(client, hindi_audio, "hi")
 
-        hindi_data = transcribe_audio(
-            client,
-            hindi_audio,
-            "hi"
-        )
+        en_duration = duration(english_audio)
+        hi_duration = duration(hindi_audio)
 
-        english_words = english_data["words"]
-        hindi_words = hindi_data["words"]
+        # Without translation-aware alignment, word positions cannot
+        # reliably identify corresponding translated phrases.
+        # This fallback creates speech blocks by proportional timing.
+        # It is an approximation, not semantic sentence alignment.
 
-        if not english_words or not hindi_words:
-            raise gr.Error(
-                "Word timestamps are unavailable. "
-                "The API response did not contain word-level timing."
-            )
+        blocks = min(len(en_words), len(hi_words))
+        if blocks < 2:
+            raise RuntimeError("Not enough timestamped speech detected.")
 
-        english_segments = split_words_by_script(
-            english_words,
-            english_script
-        )
+        output = os.path.join(work, "synchronized_hindi.mp3")
+        piece_paths = []
 
-        hindi_segments = split_words_by_script(
-            hindi_words,
-            hindi_script
-        )
+        # Divide each recording into equal-count groups.
+        # This provides a rough timing approximation only.
+        group_count = min(20, blocks)
 
-        # IMPORTANT:
-        # This first version pairs sentences by sequence.
-        # It cannot reliably resolve many-to-one translations.
+        for i in range(group_count):
+            e0 = round(i * len(en_words) / group_count)
+            e1 = round((i + 1) * len(en_words) / group_count)
+            h0 = round(i * len(hi_words) / group_count)
+            h1 = round((i + 1) * len(hi_words) / group_count)
 
-        if len(english_segments) != len(hindi_segments):
-            raise gr.Error(
-                "The scripts contain different numbers of sentences: "
-                f"English={len(english_segments)}, "
-                f"Hindi={len(hindi_segments)}. "
-                "Automatic pairing is ambiguous. "
-                "The next version needs explicit sentence mapping."
-            )
+            if e1 <= e0 or h1 <= h0:
+                continue
 
-        english_duration = english_data["duration"]
-        hindi_duration = hindi_data["duration"]
+            target_start = en_words[e0]["start"]
+            target_end = en_words[e1 - 1]["end"]
+            source_start = hi_words[h0]["start"]
+            source_end = hi_words[h1 - 1]["end"]
 
-        output_path = os.path.join(
-            temp_dir,
-            "synchronized_hindi.mp3"
-        )
+            target_len = target_end - target_start
+            source_len = source_end - source_start
 
-        pieces = []
-        timeline = 0.0
+            if target_len <= 0 or source_len <= 0:
+                continue
 
-        # Create one adjusted Hindi segment per English segment.
-        for i, (en, hi) in enumerate(
-            zip(english_segments, hindi_segments)
-        ):
-            source_start = max(0.0, hi["start"])
-            source_end = min(hindi_duration, hi["end"])
+            # atempo speed = source length / desired target length
+            speed = source_len / target_len
+            if speed < 0.5 or speed > 2.0:
+                # Skip unreliable extreme blocks rather than distort
+                # the voice severely.
+                continue
 
-            target_start = max(0.0, en["start"])
-            target_end = min(english_duration, en["end"])
-
-            source_duration = source_end - source_start
-            target_duration = target_end - target_start
-
-            if source_duration <= 0 or target_duration <= 0:
-                raise gr.Error(
-                    f"Invalid timing in segment {i + 1}."
-                )
-
-            tempo = build_tempo_filter(
-                source_duration,
-                target_duration
-            )
-
-            piece_path = os.path.join(
-                temp_dir,
-                f"piece_{i:03d}.mp3"
-            )
+            piece = os.path.join(work, f"piece_{i:03d}.wav")
 
             run_ffmpeg([
                 "-ss", str(source_start),
-                "-t", str(source_duration),
+                "-t", str(source_len),
                 "-i", hindi_audio,
-                "-af", tempo,
+                "-af", tempo_filter(speed),
                 "-ar", "44100",
                 "-ac", "2",
-                "-b:a", "192k",
-                piece_path
+                piece
             ])
 
-            pieces.append(piece_path)
+            piece_paths.append((target_start, piece))
 
-        # Concatenate the adjusted pieces.
-        # This basic version does not yet insert silence at
-        # the original English sentence timestamps.
+        if not piece_paths:
+            raise RuntimeError(
+                "No segments could be aligned safely. "
+                "Try shorter, clearer audio."
+            )
 
-        concat_file = os.path.join(temp_dir, "concat.txt")
+        # Place each adjusted piece at its estimated English start time.
+        inputs = []
+        filters = []
+        labels = []
 
-        with open(concat_file, "w", encoding="utf-8") as f:
-            for piece in pieces:
-                safe_path = piece.replace("'", "'\\''")
-                f.write(f"file '{safe_path}'\n")
+        for i, (start, piece) in enumerate(piece_paths):
+            inputs.extend(["-i", piece])
+            delay_ms = max(0, int(start * 1000))
+            label = f"a{i}"
+            filters.append(
+                f"[{i}:a]adelay={delay_ms}|{delay_ms}[{label}]"
+            )
+            labels.append(f"[{label}]")
 
-        run_ffmpeg([
-            "-f", "concat",
-            "-safe", "0",
-            "-i", concat_file,
-            "-c:a", "libmp3lame",
-            "-b:a", "192k",
-            output_path
-        ])
-
-        return (
-            output_path,
-            "Processing completed. Please review the output; "
-            "this prototype does not guarantee exact synchronization."
+        filters.append(
+            "".join(labels) +
+            f"amix=inputs={len(labels)}:duration=longest:normalize=0,"
+            f"atrim=duration={en_duration}[out]"
         )
 
-    except gr.Error:
-        raise
+        run_ffmpeg(
+            inputs + [
+                "-filter_complex", ";".join(filters),
+                "-map", "[out]",
+                "-codec:a", "libmp3lame",
+                "-b:a", "192k",
+                output
+            ]
+        )
+
+        return output, (
+            "Audio processed. This is an approximate alignment: "
+            "the system has not semantically verified translated "
+            "sentence matches. Please listen and check synchronization."
+        )
 
     except Exception as exc:
-        raise gr.Error(
-            f"Processing failed: {str(exc)[:700]}"
-        )
+        raise gr.Error(str(exc)[:700])
 
-    finally:
-        # Do not delete output files here; Gradio needs the file.
-        # Temporary files will be cleaned by the OS/service later.
-        pass
-
-
-# ---------------- USER INTERFACE ----------------
 
 with gr.Blocks(title="AudioSync AI") as app:
     gr.Markdown(
         "# AudioSync AI\n"
-        "Upload English and Hindi audio with their scripts."
+        "Upload English and Hindi audio. Scripts are not required."
     )
 
     with gr.Row():
-        english_audio = gr.Audio(
-            label="English Audio",
-            type="filepath"
-        )
+        english = gr.Audio(label="English Audio", type="filepath")
+        hindi = gr.Audio(label="Hindi Audio", type="filepath")
 
-        hindi_audio = gr.Audio(
-            label="Hindi Audio",
-            type="filepath"
-        )
-
-    with gr.Row():
-        english_script = gr.Textbox(
-            label="English Script",
-            lines=8
-        )
-
-        hindi_script = gr.Textbox(
-            label="Hindi Script",
-            lines=8
-        )
-
-    run_button = gr.Button(
-        "Synchronize Audio",
-        variant="primary"
-    )
-
-    output_audio = gr.Audio(
-        label="Synchronized Hindi MP3",
-        type="filepath"
-    )
-
+    button = gr.Button("Synchronize Audio", variant="primary")
+    result = gr.Audio(label="Hindi Audio Output", type="filepath")
     status = gr.Textbox(label="Status")
 
-    run_button.click(
-        fn=synchronize,
-        inputs=[
-            english_audio,
-            hindi_audio,
-            english_script,
-            hindi_script
-        ],
-        outputs=[output_audio, status]
+    button.click(
+        synchronize,
+        inputs=[english, hindi],
+        outputs=[result, status]
     )
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-
     app.launch(
         server_name="0.0.0.0",
-        server_port=port
-    )
+        server_port=int(os.environ.get("PORT", 10000))
+            )
