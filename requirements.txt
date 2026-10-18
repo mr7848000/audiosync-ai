@@ -2,3 +2,4 @@ gradio
 groq
 pydub
 imageio-ffmpeg
+rapidfuzz
