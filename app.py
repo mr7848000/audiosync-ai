@@ -21,7 +21,7 @@ API_KEY = os.environ.get("GROQ_API_KEY")
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 MAX_FILE_MB = 24
-ALIGNMENT_BATCH_SIZE = 12
+ALIGNMENT_BATCH_SIZE = 4
 
 MIN_SPEED = 0.75
 MAX_SPEED = 1.35
