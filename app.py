@@ -162,8 +162,13 @@ HINDI:
 
     content = response.choices[0].message.content
 
-    if not content or not content.strip():
-        raise RuntimeError("The alignment model returned an empty response.")
+        if not content or not content.strip():
+        choice = response.choices[0]
+        raise RuntimeError(
+            f"AI returned empty content. "
+            f"Finish reason: {choice.finish_reason}. "
+            f"Response: {response}"
+        )
 
     content = content.strip()
     content = re.sub(r"^```(?:json)?\s*", "", content)
