@@ -116,10 +116,10 @@ def transcribe_audio(client, path, language):
 
         for item in (getattr(response, "words", None) or []):
             words.append({
-                "word": item.word,
-                "start": float(item.start),
-                "end": float(item.end)
-            })
+    "word": item.get("word") if isinstance(item, dict) else item.word,
+    "start": float(item.get("start") if isinstance(item, dict) else item.start),
+    "end": float(item.get("end") if isinstance(item, dict) else item.end)
+})
 
         return {
             "text": response.text,
