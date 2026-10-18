@@ -207,11 +207,11 @@ def build_tempo_filter(source_duration, target_duration):
 
     speed = source_duration / target_duration
 
-    if speed < 0.65 or speed > 1.55:
-        raise ValueError(
-            "A sentence needs too much speed adjustment. "
-            "The scripts may not align correctly."
-        )
+    if speed < 0.40 or speed > 2.50:
+    raise ValueError(
+        "Sentence timing is too different. "
+        "The sentence mapping needs correction."
+    )
 
     filters = []
 
