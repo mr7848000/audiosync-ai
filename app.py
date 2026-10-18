@@ -166,9 +166,28 @@ HINDI:
         temperature=0
     )
 
-    content = response.choices[0].message.content.strip()
-    content = re.sub(r"^```(?:json)?\s*", "", content)
-    content = re.sub(r"\s*```$", "", content)
+    content = response.choices[0].message.content
+
+if not content or not content.strip():
+    raise RuntimeError(
+        "AI returned an empty alignment response. Please retry."
+    )
+
+content = content.strip()
+content = re.sub(r"^```(?:json)?\s*", "", content)
+content = re.sub(r"\s*```$", "", content)
+
+# Recover JSON if the model added text before or after it.
+start = content.find("{")
+end = content.rfind("}")
+
+if start == -1 or end == -1 or end < start:
+    raise RuntimeError(
+        "AI did not return valid JSON. Please retry."
+    )
+
+data = json.loads(content[start:end + 1])
+groups = data.get("groups", [])
 
     data = json.loads(content)
     groups = data.get("groups", [])
