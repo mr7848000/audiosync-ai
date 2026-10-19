@@ -1,9 +1,9 @@
 import os
 import re
 import json
+import time
 import tempfile
 import subprocess
-import shutil
 from pathlib import Path
 
 import gradio as gr
@@ -21,14 +21,20 @@ API_KEY = os.environ.get("GROQ_API_KEY")
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 MAX_FILE_MB = 24
+
+# Small batches reduce the chance of truncated responses.
 ALIGNMENT_BATCH_SIZE = 4
 
+# Avoid unnatural speed changes.
 MIN_SPEED = 0.75
 MAX_SPEED = 1.35
 
+# Maximum number of segments per matching window.
+MAX_WINDOW_SEGMENTS = 4
+
 
 # =====================================================
-# FFMPEG HELPERS
+# AUDIO HELPERS
 # =====================================================
 
 def run_ffmpeg(args, timeout=600):
@@ -41,7 +47,7 @@ def run_ffmpeg(args, timeout=600):
 
     if result.returncode != 0:
         raise RuntimeError(
-            "FFmpeg error: " + result.stderr[-1600:]
+            "FFmpeg error: " + result.stderr[-1500:]
         )
 
 
@@ -95,11 +101,11 @@ def transcribe(client, audio_path, language):
     if size_mb > MAX_FILE_MB:
         raise RuntimeError(
             f"{Path(audio_path).name} is {size_mb:.1f} MB. "
-            "Please use an audio file smaller than 24 MB."
+            "Please use a file smaller than 24 MB."
         )
 
     with open(audio_path, "rb") as audio:
-        result = client.audio.transcriptions.create(
+        response = client.audio.transcriptions.create(
             file=(Path(audio_path).name, audio),
             model=TRANSCRIPTION_MODEL,
             language=language,
@@ -109,7 +115,7 @@ def transcribe(client, audio_path, language):
 
     segments = []
 
-    for item in getattr(result, "segments", None) or []:
+    for item in getattr(response, "segments", None) or []:
         if isinstance(item, dict):
             start = item.get("start")
             end = item.get("end")
@@ -126,7 +132,7 @@ def transcribe(client, audio_path, language):
         end = float(end)
         text = str(text).strip()
 
-        if text and end > start:
+        if end > start and text:
             segments.append({
                 "start": start,
                 "end": end,
@@ -135,58 +141,79 @@ def transcribe(client, audio_path, language):
 
     if not segments:
         raise RuntimeError(
-            f"No timestamped speech found for language: {language}"
+            f"No timestamped speech found for {language}."
         )
+
+    segments.sort(key=lambda x: x["start"])
 
     return segments
 
 
 # =====================================================
-# BATCHED AI ALIGNMENT
+# AI ALIGNMENT
 # =====================================================
 
-def ask_alignment_model(client, english_batch, hindi_batch):
-    """
-    Align two small transcript batches to avoid oversized
-    model responses.
+def parse_json_response(content):
+    if not content:
+        raise RuntimeError("AI returned an empty response.")
 
-    Each batch contains the original global segment indices.
+    content = content.strip()
+
+    content = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        content
+    )
+
+    content = re.sub(r"\s*```$", "", content)
+
+    start = content.find("{")
+    end = content.rfind("}")
+
+    if start < 0 or end < start:
+        raise RuntimeError(
+            "AI did not return a complete JSON response."
+        )
+
+    return json.loads(content[start:end + 1])
+
+
+def match_small_window(client, en_items, hi_items):
+    """
+    Align two short, chronological transcript windows.
+
+    Indices in the response refer to global segment indices.
     """
 
     prompt = f"""
-You are a professional bilingual audio alignment assistant.
+Match English transcript segments with Hindi translations
+from the same narration.
 
-Two lists contain timestamped speech from the SAME video.
-List EN is English. List HI is Hindi.
+English and Hindi sentence boundaries may differ.
 
-The Hindi is a translation or narration of the English.
-The segmentation may differ between languages.
-
-Match consecutive items that express the same meaning.
-Preserve the order of speech.
-
-Rules:
-- Use only indices supplied in the lists.
-- Every item must appear exactly once in the groups.
-- Never invent or repeat an index.
-- One group can contain multiple EN and HI items.
-- If speech exists only on one side, use an empty list
-  for the other side.
-- Do not match unrelated sentences just to complete a group.
-- Return JSON only.
-
-Required format:
+Return JSON only:
 {{
   "groups": [
-    {{"en": [0, 1], "hi": [0]}}
+    {{"en": [0], "hi": [0, 1]}}
   ]
 }}
 
-EN:
-{json.dumps(english_batch, ensure_ascii=False)}
+Rules:
+- Use only the supplied indices.
+- Preserve chronological order.
+- Include every supplied index exactly once.
+- Do not invent or duplicate indices.
+- Match only segments that express the same content.
+- A group may contain multiple indices from either language.
+- If a segment has no matching content in this window,
+  place it in a group with an empty opposite list.
+- Do not match unrelated speech just to fill a group.
 
-HI:
-{json.dumps(hindi_batch, ensure_ascii=False)}
+ENGLISH:
+{json.dumps(en_items, ensure_ascii=False)}
+
+HINDI:
+{json.dumps(hi_items, ensure_ascii=False)}
 """
 
     response = client.chat.completions.create(
@@ -194,10 +221,7 @@ HI:
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "Return a valid JSON object only. "
-                    "No markdown or explanation."
-                )
+                "content": "Return valid JSON only. No markdown."
             },
             {
                 "role": "user",
@@ -205,47 +229,28 @@ HI:
             }
         ],
         temperature=0,
-        max_tokens=4000
+        max_tokens=2500
     )
 
     if not response.choices:
-        raise RuntimeError("Alignment model returned no choices.")
+        raise RuntimeError("AI returned no alignment choices.")
 
     choice = response.choices[0]
-    content = choice.message.content
 
-    if not content or not content.strip():
+    if not choice.message.content:
         raise RuntimeError(
-            "Alignment model returned empty content. "
-            f"Finish reason: {choice.finish_reason}. "
-            "Try a shorter audio file or retry later."
-        )
-
-    content = content.strip()
-    content = re.sub(r"^```(?:json)?\s*", "", content)
-    content = re.sub(r"\s*```$", "", content)
-
-    first = content.find("{")
-    last = content.rfind("}")
-
-    if first < 0 or last < first:
-        raise RuntimeError(
-            "AI did not return a complete JSON response. "
+            "AI returned empty alignment content. "
             f"Finish reason: {choice.finish_reason}"
         )
 
-    data = json.loads(content[first:last + 1])
-    groups = data.get("groups")
-
-    if not isinstance(groups, list) or not groups:
-        raise RuntimeError("AI returned no alignment groups.")
-
-    return groups
+    return parse_json_response(choice.message.content).get(
+        "groups", []
+    )
 
 
-def validate_batch(groups, english_batch, hindi_batch):
-    expected_en = [x["i"] for x in english_batch]
-    expected_hi = [x["i"] for x in hindi_batch]
+def validate_window(groups, en_items, hi_items):
+    expected_en = [x["i"] for x in en_items]
+    expected_hi = [x["i"] for x in hi_items]
 
     seen_en = []
     seen_hi = []
@@ -257,114 +262,192 @@ def validate_batch(groups, english_batch, hindi_batch):
         en_ids = group.get("en", [])
         hi_ids = group.get("hi", [])
 
-        if not isinstance(en_ids, list) or not isinstance(hi_ids, list):
-            raise RuntimeError("Alignment indices must be lists.")
+        if not isinstance(en_ids, list):
+            raise RuntimeError("English indices must be a list.")
+
+        if not isinstance(hi_ids, list):
+            raise RuntimeError("Hindi indices must be a list.")
 
         if not en_ids and not hi_ids:
-            raise RuntimeError("Empty alignment group returned.")
+            raise RuntimeError("An alignment group is empty.")
 
         for index in en_ids:
             if type(index) is not int or index not in expected_en:
-                raise RuntimeError("Invalid English alignment index.")
+                raise RuntimeError("Invalid English segment index.")
 
         for index in hi_ids:
             if type(index) is not int or index not in expected_hi:
-                raise RuntimeError("Invalid Hindi alignment index.")
+                raise RuntimeError("Invalid Hindi segment index.")
 
         seen_en.extend(en_ids)
         seen_hi.extend(hi_ids)
 
     if sorted(seen_en) != sorted(expected_en):
         raise RuntimeError(
-            "AI omitted or duplicated English transcript segments."
+            "AI omitted or duplicated English segments in a window."
         )
 
     if sorted(seen_hi) != sorted(expected_hi):
         raise RuntimeError(
-            "AI omitted or duplicated Hindi transcript segments."
+            "AI omitted or duplicated Hindi segments in a window."
         )
 
-    # Each list must preserve chronological order.
-    if seen_en != expected_en:
-        raise RuntimeError("English segment order is invalid.")
-
-    if seen_hi != expected_hi:
-        raise RuntimeError("Hindi segment order is invalid.")
+    if seen_en != expected_en or seen_hi != expected_hi:
+        raise RuntimeError(
+            "AI changed transcript order in a window."
+        )
 
     return groups
 
 
 def align_segments(client, english_segments, hindi_segments):
     """
-    Process small batches to avoid the model's output-length limit.
+    Align short windows based on approximate timeline position.
 
-    Batches are created from chronological transcript sections.
-    Each batch is independently validated before being accepted.
+    This avoids asking the model to return one huge mapping.
+    Timeline windows are only an initial guide: translations
+    can have different pacing, so the result still needs review.
     """
 
-    result_groups = []
+    groups = []
 
-    en_cursor = 0
-    hi_cursor = 0
+    en_count = len(english_segments)
+    hi_count = len(hindi_segments)
 
-    while (
-        en_cursor < len(english_segments)
-        or hi_cursor < len(hindi_segments)
-    ):
-        en_batch = english_segments[
-            en_cursor:en_cursor + ALIGNMENT_BATCH_SIZE
+    if not en_count or not hi_count:
+        raise RuntimeError("One transcript contains no speech.")
+
+    # Use common timeline windows instead of pairing arbitrary
+    # groups of four English with four Hindi segments.
+    window_seconds = 20.0
+    max_time = max(
+        english_segments[-1]["end"],
+        hindi_segments[-1]["end"]
+    )
+
+    window_start = 0.0
+
+    while window_start < max_time:
+        window_end = window_start + window_seconds
+
+        en_window = [
+            {"i": i, "text": seg["text"]}
+            for i, seg in enumerate(english_segments)
+            if (
+                seg["start"] >= window_start
+                and seg["start"] < window_end
+            )
         ]
 
-        hi_batch = hindi_segments[
-            hi_cursor:hi_cursor + ALIGNMENT_BATCH_SIZE
+        hi_window = [
+            {"i": i, "text": seg["text"]}
+            for i, seg in enumerate(hindi_segments)
+            if (
+                seg["start"] >= window_start
+                and seg["start"] < window_end
+            )
         ]
 
-        en_items = [
-            {"i": en_cursor + j, "text": seg["text"]}
-            for j, seg in enumerate(en_batch)
-        ]
-
-        hi_items = [
-            {"i": hi_cursor + j, "text": seg["text"]}
-            for j, seg in enumerate(hi_batch)
-        ]
-
-        if not en_items or not hi_items:
-            # Remaining speech exists on only one side.
-            if en_items:
-                result_groups.append({
-                    "en": [x["i"] for x in en_items],
-                    "hi": []
-                })
-
-            if hi_items:
-                result_groups.append({
-                    "en": [],
-                    "hi": [x["i"] for x in hi_items]
-                })
-
-            en_cursor += len(en_batch)
-            hi_cursor += len(hi_batch)
+        # Include speech that crosses a window boundary.
+        if not en_window and not hi_window:
+            window_start = window_end
             continue
 
-        groups = ask_alignment_model(
-            client,
-            en_items,
-            hi_items
+        # Large windows are subdivided to keep responses short.
+        en_chunks = [
+            en_window[i:i + ALIGNMENT_BATCH_SIZE]
+            for i in range(0, len(en_window), ALIGNMENT_BATCH_SIZE)
+        ]
+
+        hi_chunks = [
+            hi_window[i:i + ALIGNMENT_BATCH_SIZE]
+            for i in range(0, len(hi_window), ALIGNMENT_BATCH_SIZE)
+        ]
+
+        # When both sides have speech, use the smallest common
+        # chunks. This is approximate, not forced alignment.
+        if en_window and hi_window:
+            count = max(len(en_chunks), len(hi_chunks))
+
+            for chunk_index in range(count):
+                en_items = (
+                    en_chunks[chunk_index]
+                    if chunk_index < len(en_chunks)
+                    else []
+                )
+
+                hi_items = (
+                    hi_chunks[chunk_index]
+                    if chunk_index < len(hi_chunks)
+                    else []
+                )
+
+                if not en_items or not hi_items:
+                    groups.append({
+                        "en": [x["i"] for x in en_items],
+                        "hi": [x["i"] for x in hi_items]
+                    })
+                    continue
+
+                matched = match_small_window(
+                    client,
+                    en_items,
+                    hi_items
+                )
+
+                matched = validate_window(
+                    matched,
+                    en_items,
+                    hi_items
+                )
+
+                groups.extend(matched)
+
+                # Small delay helps avoid rapid repeated requests.
+                time.sleep(0.15)
+
+        elif en_window:
+            groups.append({
+                "en": [x["i"] for x in en_window],
+                "hi": []
+            })
+
+        else:
+            groups.append({
+                "en": [],
+                "hi": [x["i"] for x in hi_window]
+            })
+
+        window_start = window_end
+
+    # Validate global coverage.
+    all_en = [
+        i
+        for group in groups
+        for i in group["en"]
+    ]
+
+    all_hi = [
+        i
+        for group in groups
+        for i in group["hi"]
+    ]
+
+    if sorted(all_en) != list(range(en_count)):
+        raise RuntimeError(
+            "Final alignment omitted or duplicated English segments."
         )
 
-        validate_batch(groups, en_items, hi_items)
+    if sorted(all_hi) != list(range(hi_count)):
+        raise RuntimeError(
+            "Final alignment omitted or duplicated Hindi segments."
+        )
 
-        result_groups.extend(groups)
-
-        en_cursor += len(en_batch)
-        hi_cursor += len(hi_batch)
-
-    return result_groups
+    return groups
 
 
 # =====================================================
-# AUDIO TIMELINE
+# AUDIO SYNCHRONIZATION
 # =====================================================
 
 def synchronize_audio(
@@ -374,11 +457,11 @@ def synchronize_audio(
 ):
     if not API_KEY:
         raise gr.Error(
-            "GROQ_API_KEY is missing. Add it in Render Environment."
+            "GROQ_API_KEY is missing in Render Environment."
         )
 
     if not english_audio or not hindi_audio:
-        raise gr.Error("Upload both English and Hindi audio.")
+        raise gr.Error("Upload both audio files.")
 
     client = Groq(api_key=API_KEY)
     work_dir = tempfile.mkdtemp(prefix="audiosync_")
@@ -389,28 +472,30 @@ def synchronize_audio(
         english_duration = get_duration(english_audio)
         hindi_duration = get_duration(hindi_audio)
 
-        progress(0.12, desc="Transcribing English audio")
+        progress(0.15, desc="Transcribing English")
 
-        english_segments = transcribe(
-            client, english_audio, "en"
+        en_segments = transcribe(
+            client,
+            english_audio,
+            "en"
         )
 
-        progress(0.32, desc="Transcribing Hindi audio")
+        progress(0.35, desc="Transcribing Hindi")
 
-        hindi_segments = transcribe(
-            client, hindi_audio, "hi"
+        hi_segments = transcribe(
+            client,
+            hindi_audio,
+            "hi"
         )
 
-        progress(0.52, desc="Matching transcript sections")
+        progress(0.55, desc="Matching transcript windows")
 
         groups = align_segments(
             client,
-            english_segments,
-            hindi_segments
+            en_segments,
+            hi_segments
         )
 
-        # Map each matched Hindi group to the corresponding
-        # English timeline interval.
         placements = []
         warnings = []
 
@@ -420,36 +505,34 @@ def synchronize_audio(
 
             if not hi_ids:
                 warnings.append(
-                    f"Group {group_number}: English speech has "
-                    "no matched Hindi speech."
+                    f"Group {group_number}: no Hindi speech matched."
                 )
                 continue
 
             hi_ids = sorted(hi_ids)
 
-            source_start = hindi_segments[hi_ids[0]]["start"]
-            source_end = hindi_segments[hi_ids[-1]]["end"]
+            source_start = hi_segments[hi_ids[0]]["start"]
+            source_end = hi_segments[hi_ids[-1]]["end"]
 
             if en_ids:
                 en_ids = sorted(en_ids)
 
-                target_start = english_segments[en_ids[0]]["start"]
-                target_end = english_segments[en_ids[-1]]["end"]
+                target_start = en_segments[en_ids[0]]["start"]
+                target_end = en_segments[en_ids[-1]]["end"]
             else:
-                # No English target exists, so retain the
-                # approximate Hindi timestamp instead.
                 target_start = source_start
                 target_end = source_end
 
                 warnings.append(
                     f"Group {group_number}: Hindi-only speech "
-                    "retained near its original timestamp."
+                    "kept near its original timestamp."
                 )
+
+            source_start = max(0.0, source_start)
+            source_end = min(hindi_duration, source_end)
 
             target_start = max(0.0, target_start)
             target_end = min(english_duration, target_end)
-            source_start = max(0.0, source_start)
-            source_end = min(hindi_duration, source_end)
 
             source_length = source_end - source_start
             target_length = target_end - target_start
@@ -462,13 +545,12 @@ def synchronize_audio(
 
             speed = source_length / target_length
 
-            # Never force a large speed change. Place the speech
-            # at the target start and preserve natural voice speed.
-            if speed < MIN_SPEED or speed > MAX_SPEED:
+            # Preserve natural speed when matching would require
+            # extreme time stretching.
+            if not MIN_SPEED <= speed <= MAX_SPEED:
                 warnings.append(
-                    f"Group {group_number}: required speed "
-                    f"{speed:.2f}x exceeds the natural range; "
-                    "speech kept at original speed."
+                    f"Group {group_number}: speed {speed:.2f}x "
+                    "was outside the safe range; kept at natural speed."
                 )
                 speed = 1.0
 
@@ -489,17 +571,14 @@ def synchronize_audio(
 
             placements.append({
                 "path": piece_path,
-                "start": target_start,
-                "end": target_end
+                "start": target_start
             })
 
         if not placements:
-            raise RuntimeError("No Hindi audio segments could be placed.")
+            raise RuntimeError("No Hindi audio segments were placed.")
 
-        progress(0.72, desc="Building synchronized timeline")
+        progress(0.75, desc="Building the output timeline")
 
-        # Mix clips at their target timestamps. Silence is preserved
-        # between clips; clips are not simply concatenated together.
         inputs = []
         filters = []
         labels = []
@@ -507,12 +586,17 @@ def synchronize_audio(
         for i, piece in enumerate(placements):
             inputs.extend(["-i", piece["path"]])
 
-            delay = max(0, int(piece["start"] * 1000))
+            delay_ms = max(
+                0,
+                int(piece["start"] * 1000)
+            )
+
             label = f"a{i}"
 
             filters.append(
-                f"[{i}:a]adelay={delay}|{delay}[{label}]"
+                f"[{i}:a]adelay={delay_ms}|{delay_ms}[{label}]"
             )
+
             labels.append(f"[{label}]")
 
         filters.append(
@@ -528,17 +612,20 @@ def synchronize_audio(
 
         run_ffmpeg(
             inputs + [
-                "-filter_complex", ";".join(filters),
-                "-map", "[mixed]",
-                "-t", f"{english_duration:.4f}",
-                "-codec:a", "libmp3lame",
-                "-b:a", "192k",
+                "-filter_complex",
+                ";".join(filters),
+                "-map",
+                "[mixed]",
+                "-t",
+                f"{english_duration:.4f}",
+                "-codec:a",
+                "libmp3lame",
+                "-b:a",
+                "192k",
                 output_path
             ],
             timeout=900
         )
-
-        progress(0.95, desc="Checking exported audio")
 
         final_duration = get_duration(output_path)
 
@@ -547,15 +634,15 @@ def synchronize_audio(
             f"English duration: {english_duration:.2f}s\n"
             f"Hindi duration: {hindi_duration:.2f}s\n"
             f"Output duration: {final_duration:.2f}s\n"
-            f"English speech segments: {len(english_segments)}\n"
-            f"Hindi speech segments: {len(hindi_segments)}\n"
+            f"English segments: {len(en_segments)}\n"
+            f"Hindi segments: {len(hi_segments)}\n"
             f"Alignment groups: {len(groups)}\n\n"
-            "IMPORTANT: Transcript matching is AI-based and approximate. "
-            "Please listen to verify sentence alignment."
+            "IMPORTANT: This is approximate automatic alignment. "
+            "Please review the output against the English audio."
         )
 
         if warnings:
-            status += "\n\nWarnings:\n- " + "\n- ".join(warnings[:15])
+            status += "\n\nWarnings:\n- " + "\n- ".join(warnings[:12])
 
         progress(1.0, desc="Finished")
 
@@ -566,13 +653,8 @@ def synchronize_audio(
 
     except Exception as exc:
         raise gr.Error(
-            f"Processing failed: {str(exc)[:1000]}"
+            f"Processing failed: {str(exc)[:900]}"
         )
-
-    finally:
-        # Keep the output directory alive so Gradio can serve
-        # the generated file. Render may remove it on restart.
-        pass
 
 
 # =====================================================
@@ -583,7 +665,7 @@ with gr.Blocks(title="AudioSync AI") as app:
     gr.Markdown(
         "# AudioSync AI\n"
         "Upload English and Hindi audio. "
-        "Transcription and timestamps are generated automatically."
+        "Transcripts and timestamps are generated automatically."
     )
 
     with gr.Row():
