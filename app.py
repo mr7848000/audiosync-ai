@@ -20,8 +20,6 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 AI33_API_KEY = os.environ.get("AI33_API_KEY")
 
 GROQ_TRANSCRIPTION_MODEL = "whisper-large-v3"
-
-# Updated translation model
 GROQ_TRANSLATION_MODEL = "openai/gpt-oss-120b"
 
 AI33_TTS_URL = "https://api.ai33.pro/v3/text-to-speech"
@@ -31,10 +29,8 @@ VOICE_ID = "minimax_2618345"
 VOICE_MODEL = "speech-02-hd"
 
 MAX_FILE_MB = 24
-
 MIN_SPEED = 1.0
 MAX_SPEED = 1.5
-
 TRANSLATION_MAX_ATTEMPTS = 3
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
@@ -136,9 +132,7 @@ def make_atempo(speed):
 # =====================================================
 
 def transcribe_english(client, audio_path):
-    size_mb = (
-        os.path.getsize(audio_path) / (1024 * 1024)
-    )
+    size_mb = os.path.getsize(audio_path) / (1024 * 1024)
 
     if size_mb > MAX_FILE_MB:
         raise RuntimeError(
@@ -209,10 +203,7 @@ def group_sentences(segments):
             current["text"] += " " + segment["text"].strip()
 
         sentence_end = bool(
-            re.search(
-                r"""[.!?]["')\]]*$""",
-                current["text"]
-            )
+            re.search(r"""[.!?]["')\]]*$""", current["text"])
         )
 
         too_long = len(current["text"]) >= 180
@@ -237,19 +228,8 @@ def group_sentences(segments):
 
 def clean_translation(text):
     text = text.strip()
-
-    text = re.sub(
-        r"^```[^\n]*\n?",
-        "",
-        text
-    )
-
-    text = re.sub(
-        r"\n?```$",
-        "",
-        text
-    )
-
+    text = re.sub(r"^```[^\n]*\n?", "", text)
+    text = re.sub(r"\n?```$", "", text)
     text = re.sub(
         r"^(Translation|Hindi translation|हिंदी अनुवाद)\s*:\s*",
         "",
@@ -273,10 +253,7 @@ English sentence:
 
     last_error = "Unknown translation error"
 
-    for attempt in range(
-        1,
-        TRANSLATION_MAX_ATTEMPTS + 1
-    ):
+    for attempt in range(1, TRANSLATION_MAX_ATTEMPTS + 1):
         try:
             response = client.chat.completions.create(
                 model=GROQ_TRANSLATION_MODEL,
@@ -364,10 +341,7 @@ def translate_sentences(client, sentences, progress=None):
         if progress:
             progress(
                 (index + 1) / max(total, 1),
-                desc=(
-                    f"Translating sentence "
-                    f"{index + 1}/{total}"
-                )
+                desc=f"Translating sentence {index + 1}/{total}"
             )
 
     if len(translated) != len(sentences):
@@ -383,18 +357,54 @@ def translate_sentences(client, sentences, progress=None):
 # =====================================================
 
 def get_task(task_id):
-    response = requests.get(
-        f"{AI33_TASK_URL}/{task_id}",
-        headers={
-            "xi-api-key": AI33_API_KEY,
-            "Content-Type": "application/json"
-        },
-        timeout=45
+    """
+    Retry temporary AI33 server/network errors instead of
+    immediately failing the entire dubbing job.
+    """
+    last_error = "Unknown AI33 task-check error"
+
+    for attempt in range(1, 6):
+        try:
+            response = requests.get(
+                f"{AI33_TASK_URL}/{task_id}",
+                headers={
+                    "xi-api-key": AI33_API_KEY,
+                    "Content-Type": "application/json"
+                },
+                timeout=45
+            )
+
+            if response.status_code in (429, 500, 502, 503, 504):
+                last_error = (
+                    f"AI33 task endpoint returned HTTP "
+                    f"{response.status_code}: {response.text[:300]}"
+                )
+                print(
+                    f"AI33 task check attempt {attempt}/5: "
+                    f"{last_error}",
+                    flush=True
+                )
+                if attempt < 5:
+                    time.sleep(2 * attempt)
+                    continue
+                break
+
+            response.raise_for_status()
+            return response.json()
+
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            print(
+                f"AI33 task check attempt {attempt}/5: "
+                f"{last_error[:500]}",
+                flush=True
+            )
+            if attempt < 5:
+                time.sleep(2 * attempt)
+
+    raise RuntimeError(
+        f"AI33 task check failed after 5 attempts: {last_error}"
     )
-
-    response.raise_for_status()
-
-    return response.json()
 
 
 def generate_hindi_audio(text, output_path):
@@ -440,20 +450,12 @@ def generate_hindi_audio(text, output_path):
     while time.time() < deadline:
         task = get_task(task_id)
 
-        status = str(
-            task.get("status", "")
-        ).lower()
+        status = str(task.get("status", "")).lower()
 
-        if status in (
-            "error",
-            "failed",
-            "cancelled"
-        ):
+        if status in ("error", "failed", "cancelled"):
             raise RuntimeError(
                 "AI33 voice generation failed: "
-                + str(
-                    task.get("error_message") or task
-                )[:800]
+                + str(task.get("error_message") or task)[:800]
             )
 
         metadata = task.get("metadata") or {}
@@ -491,11 +493,7 @@ def generate_hindi_audio(text, output_path):
 # AUDIO TIMELINE
 # =====================================================
 
-def build_dubbed_audio(
-    sentences,
-    english_duration,
-    work_dir
-):
+def build_dubbed_audio(sentences, english_duration, work_dir):
     pieces = []
     warnings = []
     previous_end = 0.0
@@ -514,10 +512,7 @@ def build_dubbed_audio(
             f"hindi_{index:04d}.mp3"
         )
 
-        generate_hindi_audio(
-            hindi_text,
-            source_path
-        )
+        generate_hindi_audio(hindi_text, source_path)
 
         original_duration = get_duration(source_path)
 
@@ -527,9 +522,7 @@ def build_dubbed_audio(
             )
             continue
 
-        desired_start = float(
-            sentence["start"]
-        )
+        desired_start = float(sentence["start"])
 
         next_start = (
             float(sentences[index + 1]["start"])
@@ -537,31 +530,18 @@ def build_dubbed_audio(
             else english_duration
         )
 
-        target_start = max(
-            desired_start,
-            previous_end
-        )
-
-        available = max(
-            0.10,
-            next_start - target_start
-        )
+        target_start = max(desired_start, previous_end)
+        available = max(0.10, next_start - target_start)
 
         speed = 1.0
 
         if original_duration > available:
-            required_speed = (
-                original_duration / available
-            )
+            required_speed = original_duration / available
 
             if required_speed <= MAX_SPEED:
-                speed = max(
-                    MIN_SPEED,
-                    required_speed
-                )
+                speed = max(MIN_SPEED, required_speed)
             else:
                 speed = MAX_SPEED
-
                 warnings.append(
                     f"Sentence {index + 1}: Hindi speech exceeds "
                     "the available time window."
@@ -581,14 +561,9 @@ def build_dubbed_audio(
             processed_path
         ])
 
-        actual_duration = get_duration(
-            processed_path
-        )
+        actual_duration = get_duration(processed_path)
 
-        if (
-            target_start + actual_duration
-            > english_duration
-        ):
+        if target_start + actual_duration > english_duration:
             warnings.append(
                 f"Sentence {index + 1}: audio extends beyond "
                 "the English duration."
@@ -600,9 +575,7 @@ def build_dubbed_audio(
             "duration": actual_duration
         })
 
-        previous_end = (
-            target_start + actual_duration
-        )
+        previous_end = target_start + actual_duration
 
     if not pieces:
         raise RuntimeError(
@@ -636,33 +609,18 @@ def build_dubbed_audio(
             timeline_parts.append(silence_path)
             cursor = start
 
-        timeline_parts.append(
-            piece["path"]
-        )
-
-        cursor = (
-            start + piece["duration"]
-        )
+        timeline_parts.append(piece["path"])
+        cursor = start + piece["duration"]
 
     manifest_path = os.path.join(
         work_dir,
         "concat_list.txt"
     )
 
-    with open(
-        manifest_path,
-        "w",
-        encoding="utf-8"
-    ) as manifest:
+    with open(manifest_path, "w", encoding="utf-8") as manifest:
         for path in timeline_parts:
-            safe_path = (
-                os.path.abspath(path)
-                .replace("'", "'\\''")
-            )
-
-            manifest.write(
-                f"file '{safe_path}'\n"
-            )
+            safe_path = os.path.abspath(path).replace("'", "'\\''")
+            manifest.write(f"file '{safe_path}'\n")
 
     output_path = os.path.join(
         work_dir,
@@ -686,10 +644,7 @@ def build_dubbed_audio(
 # MAIN WORKFLOW
 # =====================================================
 
-def create_dubbing(
-    english_audio,
-    progress=gr.Progress()
-):
+def create_dubbing(english_audio, progress=gr.Progress()):
     if not GROQ_API_KEY:
         raise gr.Error(
             "GROQ_API_KEY is missing in Render Environment."
@@ -705,34 +660,16 @@ def create_dubbing(
             "Please upload an English audio file."
         )
 
-    work_dir = tempfile.mkdtemp(
-        prefix="ai_dubbing_"
-    )
+    work_dir = tempfile.mkdtemp(prefix="ai_dubbing_")
 
     try:
-        progress(
-            0.03,
-            desc="Preparing audio"
-        )
+        progress(0.03, desc="Preparing audio")
 
-        prepared_audio = os.path.join(
-            work_dir,
-            "english.mp3"
-        )
+        prepared_audio = os.path.join(work_dir, "english.mp3")
+        prepare_audio(english_audio, prepared_audio)
 
-        prepare_audio(
-            english_audio,
-            prepared_audio
-        )
-
-        duration = get_duration(
-            prepared_audio
-        )
-
-        size_mb = (
-            os.path.getsize(prepared_audio)
-            / (1024 * 1024)
-        )
+        duration = get_duration(prepared_audio)
+        size_mb = os.path.getsize(prepared_audio) / (1024 * 1024)
 
         if size_mb > MAX_FILE_MB:
             raise RuntimeError(
@@ -740,48 +677,30 @@ def create_dubbing(
                 "Please upload a shorter or lower-bitrate audio."
             )
 
-        client = Groq(
-            api_key=GROQ_API_KEY
-        )
+        client = Groq(api_key=GROQ_API_KEY)
 
-        progress(
-            0.10,
-            desc="Transcribing English speech"
-        )
+        progress(0.10, desc="Transcribing English speech")
 
         english_segments = transcribe_english(
             client,
             prepared_audio
         )
 
-        progress(
-            0.25,
-            desc="Grouping sentences"
-        )
+        progress(0.25, desc="Grouping sentences")
 
-        sentences = group_sentences(
-            english_segments
-        )
+        sentences = group_sentences(english_segments)
 
         if not sentences:
-            raise RuntimeError(
-                "No sentences were detected."
-            )
+            raise RuntimeError("No sentences were detected.")
 
-        progress(
-            0.35,
-            desc="Translating into Hinglish"
-        )
+        progress(0.35, desc="Translating into Hinglish")
 
         translated_sentences = translate_sentences(
             client,
             sentences
         )
 
-        progress(
-            0.50,
-            desc="Generating Hindi cloned voice"
-        )
+        progress(0.50, desc="Generating Hindi cloned voice")
 
         dubbed_path, warnings = build_dubbed_audio(
             translated_sentences,
@@ -789,26 +708,18 @@ def create_dubbing(
             work_dir
         )
 
-        progress(
-            0.95,
-            desc="Preparing download"
-        )
+        progress(0.95, desc="Preparing download")
 
-        final_duration = get_duration(
-            dubbed_path
-        )
+        final_duration = get_duration(dubbed_path)
 
         status_text = (
             "Dubbing completed.\n\n"
             f"English duration: {duration:.2f} seconds\n"
             f"Dubbed duration: {final_duration:.2f} seconds\n"
-            f"English transcript segments: "
-            f"{len(english_segments)}\n"
-            f"Sentences translated: "
-            f"{len(translated_sentences)}\n"
+            f"English transcript segments: {len(english_segments)}\n"
+            f"Sentences translated: {len(translated_sentences)}\n"
             f"Voice ID: {VOICE_ID}\n"
-            f"Translation model: "
-            f"{GROQ_TRANSLATION_MODEL}\n"
+            f"Translation model: {GROQ_TRANSLATION_MODEL}\n"
         )
 
         if warnings:
@@ -822,10 +733,7 @@ def create_dubbing(
             "translation and synchronization."
         )
 
-        progress(
-            1.0,
-            desc="Finished"
-        )
+        progress(1.0, desc="Finished")
 
         return dubbed_path, status_text
 
@@ -840,8 +748,7 @@ def create_dubbing(
         )
 
         raise gr.Error(
-            "Dubbing failed: "
-            + str(exc)[:1500]
+            "Dubbing failed: " + str(exc)[:1500]
         )
 
 
@@ -893,13 +800,9 @@ Voice Generation → Timeline Synchronization
 
 
 if __name__ == "__main__":
-    app.queue(
-        default_concurrency_limit=1
-    )
+    app.queue(default_concurrency_limit=1)
 
     app.launch(
         server_name="0.0.0.0",
-        server_port=int(
-            os.environ.get("PORT", 10000)
-        )
-)
+        server_port=int(os.environ.get("PORT", 10000))
+    )
