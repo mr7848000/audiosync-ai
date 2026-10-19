@@ -26,7 +26,7 @@ GROQ_TRANSLATION_MODEL = "openai/gpt-oss-20b"
 AI33_TTS_URL = "https://api.ai33.pro/v3/text-to-speech"
 AI33_TASK_URL = "https://api.ai33.pro/v1/task"
 
-VOICE_ID = "2618345"
+VOICE_ID = "minimax_2618345"
 VOICE_MODEL = "speech-02-hd"
 
 MAX_FILE_MB = 24
