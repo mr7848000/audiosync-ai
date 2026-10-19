@@ -22,7 +22,7 @@ AI33_API_KEY = os.environ.get("AI33_API_KEY")
 GROQ_TRANSCRIPTION_MODEL = "whisper-large-v3"
 
 # Primary translation model
-GROQ_TRANSLATION_MODEL = "openai/gpt-oss-20b"
+GROQ_TRANSLATION_MODEL = "openai/gpt-oss-120b"
 
 AI33_TTS_URL = "https://api.ai33.pro/v3/text-to-speech"
 AI33_TASK_URL = "https://api.ai33.pro/v1/task"
