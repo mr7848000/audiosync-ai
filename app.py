@@ -247,7 +247,7 @@ def translate_sentences(client, sentences):
 
     translated = []
 
-    batch_size = 8
+    batch_size = 3
 
     for offset in range(0, len(sentences), batch_size):
         batch = sentences[offset:offset + batch_size]
