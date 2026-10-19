@@ -1,30 +1,57 @@
 import os
 import re
 import json
+import time
 import tempfile
 import subprocess
-import shutil
+import requests
+
 from pathlib import Path
 
 import gradio as gr
-from groq import Groq
 import imageio_ffmpeg
+from groq import Groq
+
 
 # =====================================================
 # CONFIGURATION
 # =====================================================
 
-TRANSCRIPTION_MODEL = "whisper-large-v3"
-ALIGNMENT_MODEL = "openai/gpt-oss-20b"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+AI33_API_KEY = os.environ.get("AI33_API_KEY")
 
-API_KEY = os.environ.get("GROQ_API_KEY")
-FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+GROQ_TRANSCRIPTION_MODEL = "whisper-large-v3"
+GROQ_TRANSLATION_MODEL = "openai/gpt-oss-20b"
+
+AI33_TTS_URL = "https://api.ai33.pro/v3/text-to-speech"
+AI33_TASK_URL = "https://api.ai33.pro/v1/task"
+
+VOICE_ID = "2618345"
+VOICE_MODEL = "speech-02-hd"
 
 MAX_FILE_MB = 24
-BATCH_SIZE = 8
 
-MIN_SPEED = 0.80
-MAX_SPEED = 1.25
+MIN_SPEED = 1.0
+MAX_SPEED = 1.5
+
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+
+TRANSLATION_INSTRUCTIONS = """
+Translate the script in mix of hindi and english.
+Keep the words in english while rest of the sentence
+in devanagri hindi language.
+Script should be conversational, not traditional translation.
+Don't make any headings or bullet points, keep simple text.
+Translate sentence by sentence, but only show the translated text.
+
+Additional rules:
+- Do not skip any sentence.
+- Do not summarize or shorten the script.
+- Preserve the original meaning and sentence order.
+- Keep English technical terms in English.
+- Write Hindi words in Devanagari.
+- Return only the translated text.
+"""
 
 
 # =====================================================
@@ -41,13 +68,13 @@ def run_ffmpeg(args, timeout=600):
 
     if result.returncode != 0:
         raise RuntimeError(
-            "FFmpeg failed: " + result.stderr[-1200:]
+            "FFmpeg error: " + result.stderr[-1500:]
         )
 
 
 def get_duration(path):
     result = subprocess.run(
-        [FFMPEG, "-i", path, "-f", "null", "-"],
+        [FFMPEG, "-i", str(path), "-f", "null", "-"],
         capture_output=True,
         text=True,
         timeout=120
@@ -59,31 +86,69 @@ def get_duration(path):
     )
 
     if not match:
-        raise RuntimeError("Could not read audio duration.")
+        raise RuntimeError(
+            f"Could not read audio duration: {path}"
+        )
 
-    h, m, s = match.groups()
+    hours, minutes, seconds = match.groups()
 
-    return int(h) * 3600 + int(m) * 60 + float(s)
+    return (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + float(seconds)
+    )
+
+
+def prepare_audio(input_path, output_path):
+    run_ffmpeg([
+        "-i", str(input_path),
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-codec:a", "libmp3lame",
+        "-b:a", "96k",
+        str(output_path)
+    ])
+
+    return str(output_path)
+
+
+def make_atempo(speed):
+    filters = []
+
+    while speed > 2.0:
+        filters.append("atempo=2.0")
+        speed /= 2.0
+
+    while speed < 0.5:
+        filters.append("atempo=0.5")
+        speed /= 0.5
+
+    filters.append(f"atempo={speed:.6f}")
+
+    return ",".join(filters)
 
 
 # =====================================================
 # TRANSCRIPTION
 # =====================================================
 
-def transcribe(client, audio_path, language):
-    size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+def transcribe_english(client, audio_path):
+    size_mb = (
+        os.path.getsize(audio_path) / (1024 * 1024)
+    )
 
     if size_mb > MAX_FILE_MB:
         raise RuntimeError(
-            f"{Path(audio_path).name} is {size_mb:.1f} MB. "
-            "Please upload an MP3 smaller than 24 MB."
+            f"Audio file is {size_mb:.1f} MB. "
+            "Please upload a smaller MP3, under 24 MB."
         )
 
     with open(audio_path, "rb") as audio:
         result = client.audio.transcriptions.create(
             file=(Path(audio_path).name, audio),
-            model=TRANSCRIPTION_MODEL,
-            language=language,
+            model=GROQ_TRANSCRIPTION_MODEL,
+            language="en",
             response_format="verbose_json",
             timestamp_granularities=["segment"]
         )
@@ -103,9 +168,9 @@ def transcribe(client, audio_path, language):
         if start is None or end is None:
             continue
 
+        text = str(text).strip()
         start = float(start)
         end = float(end)
-        text = str(text).strip()
 
         if text and end > start:
             segments.append({
@@ -116,539 +181,638 @@ def transcribe(client, audio_path, language):
 
     if not segments:
         raise RuntimeError(
-            f"No timestamped speech found for {language}."
+            "No timestamped English speech was detected."
         )
 
     return segments
 
 
 # =====================================================
-# ALIGNMENT
+# GROUP ENGLISH SEGMENTS INTO SENTENCES
 # =====================================================
 
-def ask_alignment(client, english_items, hindi_items):
+def group_sentences(segments):
     """
-    Align short chronological batches.
-    The model returns local batch positions, not global indices.
-    """
-
-    prompt = f"""
-Match the English and Hindi speech segments from the same video.
-
-The Hindi is a translation of the English.
-Both lists are in chronological order.
-Sentence boundaries can differ.
-
-For each group:
-- Match speech with the same meaning.
-- Preserve chronological order.
-- Every item must be used exactly once.
-- Do not invent or repeat indices.
-- A group may contain multiple items from either list.
-- If a segment has no counterpart, use an empty list
-  on the other side.
-
-Use ONLY the local integer positions shown below.
-
-Return JSON only in this format:
-{{"groups":[{{"en":[0],"hi":[0,1]}}]}}
-
-ENGLISH:
-{json.dumps(english_items, ensure_ascii=False)}
-
-HINDI:
-{json.dumps(hindi_items, ensure_ascii=False)}
-"""
-
-    response = client.chat.completions.create(
-        model=ALIGNMENT_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Return only a compact valid JSON object. "
-                    "No markdown or explanations."
-                )
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=0,
-        max_tokens=1800
-    )
-
-    if not response.choices:
-        raise RuntimeError("Alignment model returned no choices.")
-
-    choice = response.choices[0]
-    content = choice.message.content
-
-    if not content or not content.strip():
-        raise RuntimeError(
-            "Alignment model returned empty content. "
-            f"Finish reason: {choice.finish_reason}. "
-            "Please retry."
-        )
-
-    content = content.strip()
-    content = re.sub(r"^```(?:json)?\s*", "", content)
-    content = re.sub(r"\s*```$", "", content)
-
-    start = content.find("{")
-    end = content.rfind("}")
-
-    if start < 0 or end < start:
-        raise RuntimeError(
-            "Alignment response was incomplete. "
-            f"Finish reason: {choice.finish_reason}. "
-            "Try again."
-        )
-
-    data = json.loads(content[start:end + 1])
-    groups = data.get("groups")
-
-    if not isinstance(groups, list) or not groups:
-        raise RuntimeError("No alignment groups were returned.")
-
-    seen_en = []
-    seen_hi = []
-
-    for group in groups:
-        if not isinstance(group, dict):
-            raise RuntimeError("Invalid alignment group.")
-
-        en_ids = group.get("en", [])
-        hi_ids = group.get("hi", [])
-
-        if not isinstance(en_ids, list):
-            raise RuntimeError("English indices must be a list.")
-
-        if not isinstance(hi_ids, list):
-            raise RuntimeError("Hindi indices must be a list.")
-
-        if not en_ids and not hi_ids:
-            raise RuntimeError("An empty alignment group was returned.")
-
-        for index in en_ids:
-            if type(index) is not int or not 0 <= index < len(english_items):
-                raise RuntimeError("Invalid English segment index.")
-
-        for index in hi_ids:
-            if type(index) is not int or not 0 <= index < len(hindi_items):
-                raise RuntimeError("Invalid Hindi segment index.")
-
-        seen_en.extend(en_ids)
-        seen_hi.extend(hi_ids)
-
-    if sorted(seen_en) != list(range(len(english_items))):
-        raise RuntimeError(
-            "AI omitted or duplicated English segments in a batch."
-        )
-
-    if sorted(seen_hi) != list(range(len(hindi_items))):
-        raise RuntimeError(
-            "AI omitted or duplicated Hindi segments in a batch."
-        )
-
-    if seen_en != list(range(len(english_items))):
-        raise RuntimeError("English segment order is invalid.")
-
-    if seen_hi != list(range(len(hindi_items))):
-        raise RuntimeError("Hindi segment order is invalid.")
-
-    return groups
-
-
-def align_segments(client, english_segments, hindi_segments):
-    """
-    Match short chronological windows.
-    Windows are chosen by approximate relative timeline position,
-    rather than blindly pairing equal numbers of segments.
+    Combine Whisper segments into sentence-sized groups.
+    Preserve the start and end times of the original speech.
     """
 
     groups = []
+    current = None
 
-    en_count = len(english_segments)
-    hi_count = len(hindi_segments)
+    for segment in segments:
+        if current is None:
+            current = {
+                "start": segment["start"],
+                "end": segment["end"],
+                "text": segment["text"].strip()
+            }
+        else:
+            current["end"] = segment["end"]
+            current["text"] += " " + segment["text"].strip()
 
-    en_cursor = 0
-    hi_cursor = 0
-
-    while en_cursor < en_count or hi_cursor < hi_count:
-
-        if en_cursor >= en_count:
-            groups.append({
-                "en": [],
-                "hi": list(range(hi_cursor, hi_count))
-            })
-            break
-
-        if hi_cursor >= hi_count:
-            groups.append({
-                "en": list(range(en_cursor, en_count)),
-                "hi": []
-            })
-            break
-
-        # Keep batches small so the model has room to respond.
-        en_end = min(en_cursor + BATCH_SIZE, en_count)
-
-        en_batch = english_segments[en_cursor:en_end]
-
-        # Estimate the matching Hindi time window from the
-        # relative position of the English batch.
-        en_start_time = en_batch[0]["start"]
-        en_end_time = en_batch[-1]["end"]
-
-        # Approximate expected Hindi position using relative time.
-        # This is only a windowing heuristic, not exact alignment.
-        en_total_duration = max(
-            0.1,
-            english_segments[-1]["end"]
+        # Close a group at sentence-ending punctuation.
+        # Also prevent excessively long groups.
+        sentence_end = bool(
+            re.search(r'[.!?]["\')\]]*$', current["text"])
         )
 
-        hi_total_duration = max(
-            0.1,
-            hindi_segments[-1]["end"]
-        )
+        too_long = len(current["text"]) >= 280
 
-        expected_hi_start_time = (
-            en_start_time / en_total_duration
-        ) * hi_total_duration
+        if sentence_end or too_long:
+            groups.append(current)
+            current = None
 
-        expected_hi_end_time = (
-            en_end_time / en_total_duration
-        ) * hi_total_duration
+    if current is not None:
+        groups.append(current)
 
-        # Include context on both sides to tolerate translation
-        # timing differences and different sentence segmentation.
-        lower_time = max(
-            0.0,
-            expected_hi_start_time - 12.0
-        )
+    # Remove empty groups.
+    return [
+        group for group in groups
+        if group["text"].strip()
+        and group["end"] > group["start"]
+    ]
 
-        upper_time = expected_hi_end_time + 18.0
 
-        candidates = [
-            i for i in range(hi_cursor, hi_count)
-            if hindi_segments[i]["end"] >= lower_time
-            and hindi_segments[i]["start"] <= upper_time
+# =====================================================
+# TRANSLATION
+# =====================================================
+
+def translate_sentences(client, sentences):
+    """
+    Translate each English sentence independently.
+    The response must contain one Hindi/Hinglish string
+    for every input sentence.
+    """
+
+    translated = []
+
+    batch_size = 8
+
+    for offset in range(0, len(sentences), batch_size):
+        batch = sentences[offset:offset + batch_size]
+
+        payload = [
+            {
+                "index": index,
+                "text": sentence["text"]
+            }
+            for index, sentence in enumerate(batch)
         ]
 
-        if not candidates:
-            candidates = list(
-                range(
-                    hi_cursor,
-                    min(hi_cursor + BATCH_SIZE, hi_count)
-                )
-            )
+        prompt = f"""
+{TRANSLATION_INSTRUCTIONS}
 
-        hi_start = candidates[0]
-        hi_end = min(candidates[-1] + 1, hi_count)
+Translate each item independently.
 
-        # Limit each batch to avoid excessively long model responses.
-        hi_end = min(hi_end, hi_start + BATCH_SIZE)
+IMPORTANT:
+- Return valid JSON only.
+- Use the exact input indices.
+- Return exactly one translation for each input item.
+- Do not merge sentences.
+- Do not omit sentences.
 
-        hi_batch = hindi_segments[hi_start:hi_end]
+Required format:
+{{"translations":[
+    {{"index":0,"text":"Hindi translation"}},
+    {{"index":1,"text":"Hindi translation"}}
+]}}
 
-        en_items = [
-            {"i": i, "text": english_segments[i]["text"]}
-            for i in range(en_cursor, en_end)
-        ]
+INPUT:
+{json.dumps(payload, ensure_ascii=False)}
+"""
 
-        hi_items = [
-            {"i": i, "text": hindi_segments[i]["text"]}
-            for i in range(hi_start, hi_end)
-        ]
-
-        raw_groups = ask_alignment(
-            client,
-            [
-                {"i": j, "text": item["text"]}
-                for j, item in enumerate(en_items)
+        response = client.chat.completions.create(
+            model=GROQ_TRANSLATION_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional conversational "
+                        "Hindi-Hinglish translator. Follow the "
+                        "requested format exactly."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
             ],
-            [
-                {"i": j, "text": item["text"]}
-                for j, item in enumerate(hi_items)
-            ]
+            temperature=0,
+            max_tokens=3000
         )
 
-        # Convert local positions back to global segment indices.
-        for group in raw_groups:
-            global_en = [
-                en_cursor + i for i in group["en"]
-            ]
+        if not response.choices:
+            raise RuntimeError(
+                "Translation model returned no response."
+            )
 
-            global_hi = [
-                hi_start + i for i in group["hi"]
-            ]
+        content = response.choices[0].message.content
 
-            groups.append({
-                "en": global_en,
-                "hi": global_hi
-            })
+        if not content:
+            raise RuntimeError(
+                "Translation response was empty."
+            )
 
-        en_cursor = en_end
-        hi_cursor = hi_end
-
-    return groups
-
-
-# =====================================================
-# SPEED ADJUSTMENT
-# =====================================================
-
-def make_atempo(speed):
-    if speed <= 0:
-        raise ValueError("Invalid speed ratio.")
-
-    filters = []
-
-    while speed > 2.0:
-        filters.append("atempo=2.0")
-        speed /= 2.0
-
-    while speed < 0.5:
-        filters.append("atempo=0.5")
-        speed /= 0.5
-
-    filters.append(f"atempo={speed:.6f}")
-
-    return ",".join(filters)
-
-
-# =====================================================
-# SYNCHRONIZATION
-# =====================================================
-
-def synchronize_audio(english_audio, hindi_audio, progress=gr.Progress()):
-    if not API_KEY:
-        raise gr.Error(
-            "GROQ_API_KEY is missing. Add it in Render Environment."
+        content = content.strip()
+        content = re.sub(
+            r"^```(?:json)?\s*", "", content
         )
+        content = re.sub(r"\s*```$", "", content)
 
-    if not english_audio or not hindi_audio:
-        raise gr.Error("Upload both English and Hindi audio files.")
+        start = content.find("{")
+        end = content.rfind("}")
 
-    client = Groq(api_key=API_KEY)
-    work_dir = tempfile.mkdtemp(prefix="audiosync_")
+        if start < 0 or end < start:
+            raise RuntimeError(
+                "Translation response was not valid JSON."
+            )
 
-    try:
-        progress(0.05, desc="Reading audio durations")
+        data = json.loads(content[start:end + 1])
+        items = data.get("translations")
 
-        english_duration = get_duration(english_audio)
-        hindi_duration = get_duration(hindi_audio)
+        if not isinstance(items, list):
+            raise RuntimeError(
+                "Translation list is missing."
+            )
 
-        progress(0.12, desc="Transcribing English")
+        by_index = {}
 
-        english_segments = transcribe(
-            client, english_audio, "en"
-        )
-
-        progress(0.32, desc="Transcribing Hindi")
-
-        hindi_segments = transcribe(
-            client, hindi_audio, "hi"
-        )
-
-        progress(0.52, desc="Matching transcript batches")
-
-        groups = align_segments(
-            client,
-            english_segments,
-            hindi_segments
-        )
-
-        placements = []
-        warnings = []
-
-        for number, group in enumerate(groups, start=1):
-            en_ids = group["en"]
-            hi_ids = group["hi"]
-
-            if not hi_ids:
-                warnings.append(
-                    f"Group {number}: no matching Hindi speech."
-                )
+        for item in items:
+            if not isinstance(item, dict):
                 continue
 
-            hi_ids = sorted(hi_ids)
+            index = item.get("index")
+            text = item.get("text")
 
-            source_start = hindi_segments[hi_ids[0]]["start"]
-            source_end = hindi_segments[hi_ids[-1]]["end"]
+            if (
+                type(index) is int
+                and 0 <= index < len(batch)
+                and isinstance(text, str)
+                and text.strip()
+            ):
+                if index in by_index:
+                    raise RuntimeError(
+                        "Duplicate translation index returned."
+                    )
 
-            if en_ids:
-                en_ids = sorted(en_ids)
+                by_index[index] = text.strip()
 
-                target_start = english_segments[en_ids[0]]["start"]
-                target_end = english_segments[en_ids[-1]]["end"]
+        if len(by_index) != len(batch):
+            raise RuntimeError(
+                "AI did not translate every sentence. "
+                "Please retry the operation."
+            )
+
+        for index, sentence in enumerate(batch):
+            translated.append({
+                **sentence,
+                "hindi": by_index[index]
+            })
+
+    return translated
+
+
+# =====================================================
+# AI33 PRO TASK MANAGEMENT
+# =====================================================
+
+def get_task(task_id):
+    response = requests.get(
+        f"{AI33_TASK_URL}/{task_id}",
+        headers={
+            "xi-api-key": AI33_API_KEY,
+            "Content-Type": "application/json"
+        },
+        timeout=45
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+def generate_hindi_audio(text, output_path, progress=None):
+    """
+    Submit a MiniMax TTS task and wait for its audio URL.
+    """
+
+    response = requests.post(
+        AI33_TTS_URL,
+        headers={
+            "xi-api-key": AI33_API_KEY
+        },
+        data={
+            "text": text,
+            "voice_id": VOICE_ID,
+            "speed": "1",
+            "with_transcript": "false",
+            "model": VOICE_MODEL
+        },
+        timeout=90
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            "AI33 TTS request failed: "
+            + response.text[:1000]
+        )
+
+    data = response.json()
+
+    if data.get("success") is False:
+        raise RuntimeError(
+            "AI33 rejected the TTS request: "
+            + json.dumps(data, ensure_ascii=False)[:1000]
+        )
+
+    task_id = data.get("task_id") or data.get("id")
+
+    if not task_id:
+        raise RuntimeError(
+            "AI33 response did not contain task_id. "
+            + json.dumps(data, ensure_ascii=False)[:800]
+        )
+
+    audio_url = None
+    last_status = None
+
+    # Allow up to 5 minutes for each voice generation task.
+    deadline = time.time() + 300
+
+    while time.time() < deadline:
+        task = get_task(task_id)
+
+        status = str(task.get("status", "")).lower()
+
+        if status != last_status:
+            last_status = status
+
+        if status in ("error", "failed", "cancelled"):
+            raise RuntimeError(
+                "AI33 voice generation failed: "
+                + str(task.get("error_message") or task)
+            )
+
+        metadata = task.get("metadata") or {}
+        audio_url = metadata.get("audio_url")
+
+        if status == "done" and audio_url:
+            break
+
+        time.sleep(3)
+
+    if not audio_url:
+        raise RuntimeError(
+            "AI33 task did not provide audio_url within 5 minutes."
+        )
+
+    audio_response = requests.get(
+        audio_url,
+        timeout=120
+    )
+
+    audio_response.raise_for_status()
+
+    with open(output_path, "wb") as audio_file:
+        audio_file.write(audio_response.content)
+
+    if os.path.getsize(output_path) < 100:
+        raise RuntimeError(
+            "Generated audio file is unexpectedly small."
+        )
+
+    return output_path
+
+
+# =====================================================
+# TIMELINE SYNCHRONIZATION
+# =====================================================
+
+def build_dubbed_audio(sentences, english_duration, work_dir):
+    """
+    Generate each Hindi sentence separately.
+    Place sentences chronologically.
+    Try to fit each sentence before the next English
+    sentence while avoiding overlapping clips.
+    """
+
+    pieces = []
+    warnings = []
+
+    previous_end = 0.0
+
+    total = len(sentences)
+
+    for index, sentence in enumerate(sentences):
+        hindi_text = sentence["hindi"].strip()
+
+        if not hindi_text:
+            warnings.append(
+                f"Sentence {index + 1}: empty translation."
+            )
+            continue
+
+        source_path = os.path.join(
+            work_dir,
+            f"hindi_{index:04d}.mp3"
+        )
+
+        generate_hindi_audio(
+            hindi_text,
+            source_path
+        )
+
+        original_duration = get_duration(source_path)
+
+        if original_duration <= 0:
+            warnings.append(
+                f"Sentence {index + 1}: invalid audio duration."
+            )
+            continue
+
+        desired_start = float(sentence["start"])
+        next_start = (
+            float(sentences[index + 1]["start"])
+            if index + 1 < total
+            else english_duration
+        )
+
+        # Never place a clip on top of the previous clip.
+        target_start = max(desired_start, previous_end)
+
+        available = max(
+            0.05,
+            next_start - target_start
+        )
+
+        speed = 1.0
+
+        if original_duration > available:
+            required_speed = original_duration / available
+
+            if required_speed <= MAX_SPEED:
+                speed = max(MIN_SPEED, required_speed)
             else:
-                # No corresponding English segment.
-                target_start = source_start
-                target_end = source_end
+                # Do not cut off speech just to force it
+                # into an unrealistically short interval.
+                speed = MAX_SPEED
 
                 warnings.append(
-                    f"Group {number}: Hindi-only speech retained "
-                    "near its original timestamp."
+                    f"Sentence {index + 1}: speech is longer "
+                    "than its available timeline. Timing may "
+                    "extend beyond the original sentence."
                 )
 
-            source_start = max(0.0, source_start)
-            source_end = min(hindi_duration, source_end)
+        processed_path = os.path.join(
+            work_dir,
+            f"processed_{index:04d}.wav"
+        )
 
-            target_start = max(0.0, target_start)
-            target_end = min(english_duration, target_end)
+        run_ffmpeg([
+            "-i", source_path,
+            "-af", make_atempo(speed),
+            "-ar", "44100",
+            "-ac", "2",
+            "-codec:a", "pcm_s16le",
+            processed_path
+        ])
 
-            source_length = source_end - source_start
-            target_length = target_end - target_start
+        actual_duration = get_duration(processed_path)
 
-            if source_length <= 0 or target_length <= 0:
-                warnings.append(
-                    f"Group {number}: invalid timing."
-                )
-                continue
-
-            speed = source_length / target_length
-
-            # Keep speed changes within a limited range.
-            if speed < MIN_SPEED or speed > MAX_SPEED:
-                warnings.append(
-                    f"Group {number}: required speed {speed:.2f}x "
-                    "is outside the natural range; kept original speed."
-                )
-                speed = 1.0
-
-            piece_path = os.path.join(
-                work_dir,
-                f"piece_{number:04d}.wav"
+        if target_start + actual_duration > english_duration:
+            warnings.append(
+                f"Sentence {index + 1}: audio extends beyond "
+                "the English audio duration."
             )
 
-            run_ffmpeg([
-                "-ss", f"{source_start:.4f}",
-                "-t", f"{source_length:.4f}",
-                "-i", hindi_audio,
-                "-af", make_atempo(speed),
-                "-ar", "44100",
-                "-ac", "2",
-                piece_path
-            ])
+        pieces.append({
+            "path": processed_path,
+            "start": target_start,
+            "duration": actual_duration
+        })
 
-            placements.append({
-                "path": piece_path,
-                "start": target_start
-            })
+        previous_end = target_start + actual_duration
 
-        if not placements:
-            raise RuntimeError("No Hindi audio segments could be placed.")
+    if not pieces:
+        raise RuntimeError(
+            "No Hindi audio was successfully generated."
+        )
 
-        progress(0.75, desc="Building timeline")
+    # Create the final timeline by delaying each clip.
+    inputs = []
+    filters = []
+    labels = []
 
-        inputs = []
-        filters = []
-        labels = []
+    for index, piece in enumerate(pieces):
+        inputs.extend(["-i", piece["path"]])
 
-        for i, piece in enumerate(placements):
-            inputs.extend(["-i", piece["path"]])
+        delay_ms = max(
+            0,
+            int(piece["start"] * 1000)
+        )
 
-            delay_ms = max(
-                0,
-                int(piece["start"] * 1000)
-            )
-
-            label = f"a{i}"
-
-            filters.append(
-                f"[{i}:a]adelay={delay_ms}|{delay_ms}[{label}]"
-            )
-
-            labels.append(f"[{label}]")
+        label = f"clip{index}"
 
         filters.append(
-            "".join(labels)
-            + f"amix=inputs={len(labels)}:"
-              "duration=longest:normalize=0[mixed]"
+            f"[{index}:a]"
+            f"adelay={delay_ms}|{delay_ms}"
+            f"[{label}]"
         )
 
-        output_path = os.path.join(
+        labels.append(f"[{label}]")
+
+    filters.append(
+        "".join(labels)
+        + f"amix=inputs={len(labels)}:"
+          "duration=longest:normalize=0[mix]"
+    )
+
+    output_path = os.path.join(
+        work_dir,
+        "hindi_dubbed.mp3"
+    )
+
+    run_ffmpeg(
+        inputs + [
+            "-filter_complex", ";".join(filters),
+            "-map", "[mix]",
+            "-codec:a", "libmp3lame",
+            "-b:a", "192k",
+            output_path
+        ],
+        timeout=900
+    )
+
+    return output_path, warnings
+
+
+# =====================================================
+# MAIN WORKFLOW
+# =====================================================
+
+def create_dubbing(english_audio, progress=gr.Progress()):
+    if not GROQ_API_KEY:
+        raise gr.Error(
+            "GROQ_API_KEY is missing in Render Environment."
+        )
+
+    if not AI33_API_KEY:
+        raise gr.Error(
+            "AI33_API_KEY is missing in Render Environment."
+        )
+
+    if not english_audio:
+        raise gr.Error("Please upload an English audio file.")
+
+    work_dir = tempfile.mkdtemp(
+        prefix="ai_dubbing_"
+    )
+
+    try:
+        progress(0.03, desc="Preparing audio")
+
+        prepared_audio = os.path.join(
             work_dir,
-            "synchronized_hindi.mp3"
+            "english.mp3"
         )
 
-        run_ffmpeg(
-            inputs + [
-                "-filter_complex", ";".join(filters),
-                "-map", "[mixed]",
-                "-t", f"{english_duration:.4f}",
-                "-codec:a", "libmp3lame",
-                "-b:a", "192k",
-                output_path
-            ],
-            timeout=900
+        prepare_audio(
+            english_audio,
+            prepared_audio
         )
 
-        final_duration = get_duration(output_path)
+        duration = get_duration(prepared_audio)
+
+        # Groq's transcription API has a file-size limit.
+        size_mb = (
+            os.path.getsize(prepared_audio)
+            / (1024 * 1024)
+        )
+
+        if size_mb > MAX_FILE_MB:
+            raise RuntimeError(
+                f"Prepared audio is {size_mb:.1f} MB. "
+                "Please upload a shorter or lower-bitrate audio."
+            )
+
+        client = Groq(api_key=GROQ_API_KEY)
+
+        progress(0.10, desc="Transcribing English speech")
+
+        english_segments = transcribe_english(
+            client,
+            prepared_audio
+        )
+
+        progress(0.25, desc="Grouping sentences")
+
+        sentences = group_sentences(
+            english_segments
+        )
+
+        if not sentences:
+            raise RuntimeError(
+                "No sentences were detected."
+            )
+
+        progress(0.35, desc="Translating into Hinglish")
+
+        translated_sentences = translate_sentences(
+            client,
+            sentences
+        )
+
+        progress(0.45, desc="Generating Hindi cloned voice")
+
+        # Voice generation can take time and use API credits.
+        # Update progress after each completed sentence.
+        generated_count = 0
+
+        def voice_progress(current, total):
+            nonlocal generated_count
+            generated_count = current
+
+        dubbed_path, warnings = build_dubbed_audio(
+            translated_sentences,
+            duration,
+            work_dir
+        )
+
+        progress(0.95, desc="Preparing download")
+
+        final_duration = get_duration(dubbed_path)
 
         status = (
-            "Processing completed.\n"
-            f"English duration: {english_duration:.2f}s\n"
-            f"Hindi duration: {hindi_duration:.2f}s\n"
-            f"Output duration: {final_duration:.2f}s\n"
-            f"English segments: {len(english_segments)}\n"
-            f"Hindi segments: {len(hindi_segments)}\n"
-            f"Alignment groups: {len(groups)}\n\n"
-            "IMPORTANT: Matching is approximate. Listen to verify "
-            "that the translated sentences align correctly."
+            "Dubbing completed.\n\n"
+            f"English duration: {duration:.2f} seconds\n"
+            f"Dubbed duration: {final_duration:.2f} seconds\n"
+            f"English transcript segments: "
+            f"{len(english_segments)}\n"
+            f"Sentences translated: {len(translated_sentences)}\n"
+            f"Voice: MiniMax cloned voice\n"
+            f"Voice ID: {VOICE_ID}\n"
+            f"Model: {VOICE_MODEL}\n"
         )
 
         if warnings:
             status += (
-                "\n\nWarnings:\n- "
-                + "\n- ".join(warnings[:12])
+                "\nWarnings:\n- "
+                + "\n- ".join(warnings[:15])
             )
+
+        status += (
+            "\n\nPlease listen to the output and check "
+            "pronunciation, sentence timing and translation."
+        )
 
         progress(1.0, desc="Finished")
 
-        return output_path, status
+        return dubbed_path, status
 
     except gr.Error:
         raise
 
     except Exception as exc:
         raise gr.Error(
-            f"Processing failed: {str(exc)[:900]}"
+            "Dubbing failed: " + str(exc)[:1200]
         )
+
+    finally:
+        # Do not delete files here. Gradio needs the output
+        # file to remain available for playback/download.
+        pass
 
 
 # =====================================================
 # USER INTERFACE
 # =====================================================
 
-with gr.Blocks(title="AudioSync AI") as app:
+with gr.Blocks(title="AudioSync AI - Hindi Dubbing") as app:
     gr.Markdown(
-        "# AudioSync AI\n"
-        "Upload English and Hindi audio. "
-        "Transcription and timestamps are generated automatically."
+        """
+# 🎙️ AudioSync AI — Hindi Dubbing Studio
+
+Upload English audio to generate a conversational
+Hindi/Hinglish dub using your configured cloned voice.
+
+**Automatic workflow:** Transcription → Translation →
+Voice Generation → Timeline Synchronization
+"""
     )
 
-    with gr.Row():
-        english_audio = gr.Audio(
-            label="English Audio",
-            type="filepath"
-        )
-
-        hindi_audio = gr.Audio(
-            label="Hindi Audio",
-            type="filepath"
-        )
+    english_audio = gr.Audio(
+        label="Upload English Audio",
+        type="filepath"
+    )
 
     run_button = gr.Button(
-        "Synchronize Audio",
+        "Generate Hindi Dub",
         variant="primary"
     )
 
     output_audio = gr.Audio(
-        label="Synchronized Hindi MP3",
+        label="Generated Hindi Dub",
         type="filepath"
     )
 
@@ -658,14 +822,18 @@ with gr.Blocks(title="AudioSync AI") as app:
     )
 
     run_button.click(
-        fn=synchronize_audio,
-        inputs=[english_audio, hindi_audio],
+        fn=create_dubbing,
+        inputs=[english_audio],
         outputs=[output_audio, status]
     )
 
 
 if __name__ == "__main__":
+    app.queue(default_concurrency_limit=1)
+
     app.launch(
         server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", 10000))
+        server_port=int(
+            os.environ.get("PORT", 10000)
+        )
     )
