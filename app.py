@@ -21,7 +21,7 @@ AI33_API_KEY = os.environ.get("AI33_API_KEY")
 
 GROQ_TRANSCRIPTION_MODEL = "whisper-large-v3"
 
-# Primary translation model
+# Updated translation model
 GROQ_TRANSLATION_MODEL = "openai/gpt-oss-120b"
 
 AI33_TTS_URL = "https://api.ai33.pro/v3/text-to-speech"
@@ -35,26 +35,24 @@ MAX_FILE_MB = 24
 MIN_SPEED = 1.0
 MAX_SPEED = 1.5
 
-TRANSLATION_BATCH_SIZE = 1
 TRANSLATION_MAX_ATTEMPTS = 3
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 
 TRANSLATION_INSTRUCTIONS = """
-Translate the script in mix of hindi and english.
-Keep the words in english while rest of the sentence in devanagri hindi language.
-Script should be conversational, not traditional translation.
-Don't make any headings or bullet points, keep simple text.
-Translate sentence by sentence, but only show the translated text.
+Translate the script into a natural mix of Hindi and English.
+
+Keep English words in English and write Hindi words in Devanagari.
+Use conversational Hindi, not a traditional or literal translation.
 
 Additional rules:
 - Do not skip, summarize, or shorten any sentence.
 - Preserve the original meaning and order.
 - Keep English technical terms in English.
-- Write Hindi words in Devanagari.
-- Return only the translated sentence.
-- Do not add explanations, labels, headings, or quotation marks.
+- Do not add headings, bullet points, explanations, or labels.
+- Return only the translated text.
+- Do not add quotation marks.
 """
 
 
@@ -211,7 +209,10 @@ def group_sentences(segments):
             current["text"] += " " + segment["text"].strip()
 
         sentence_end = bool(
-            re.search(r"""[.!?]["')\]]*$""", current["text"])
+            re.search(
+                r"""[.!?]["')\]]*$""",
+                current["text"]
+            )
         )
 
         too_long = len(current["text"]) >= 180
@@ -231,15 +232,24 @@ def group_sentences(segments):
 
 
 # =====================================================
-# TRANSLATION — PLAIN TEXT, NO JSON
+# TRANSLATION
 # =====================================================
 
 def clean_translation(text):
     text = text.strip()
 
-    # Remove accidental Markdown fences or labels.
-    text = re.sub(r"^```[^\n]*\n?", "", text)
-    text = re.sub(r"\n?```$", "", text)
+    text = re.sub(
+        r"^```[^\n]*\n?",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"\n?```$",
+        "",
+        text
+    )
+
     text = re.sub(
         r"^(Translation|Hindi translation|हिंदी अनुवाद)\s*:\s*",
         "",
@@ -254,8 +264,8 @@ def translate_one_sentence(client, sentence, sentence_number):
     prompt = f"""
 {TRANSLATION_INSTRUCTIONS}
 
-Translate this sentence now.
-Return only the translated text, without any preface.
+Translate this English sentence now.
+Return only the translated text.
 
 English sentence:
 {sentence}
@@ -263,7 +273,10 @@ English sentence:
 
     last_error = "Unknown translation error"
 
-    for attempt in range(1, TRANSLATION_MAX_ATTEMPTS + 1):
+    for attempt in range(
+        1,
+        TRANSLATION_MAX_ATTEMPTS + 1
+    ):
         try:
             response = client.chat.completions.create(
                 model=GROQ_TRANSLATION_MODEL,
@@ -273,8 +286,8 @@ English sentence:
                         "content": (
                             "You translate English into natural "
                             "conversational Hindi-English mix. "
-                            "Follow the user's instructions exactly. "
-                            "Return plain text only."
+                            "Follow the instructions exactly. "
+                            "Return plain translated text only."
                         )
                     },
                     {
@@ -283,7 +296,9 @@ English sentence:
                     }
                 ],
                 temperature=0,
-                max_tokens=500
+                max_completion_tokens=2048,
+                reasoning_effort="low",
+                include_reasoning=False
             )
 
             if not response.choices:
@@ -296,8 +311,9 @@ English sentence:
 
             if not content or not content.strip():
                 raise RuntimeError(
-                    "Empty translation response. "
-                    f"Finish reason: {choice.finish_reason}."
+                    "Translation response was empty. "
+                    f"Finish reason: {choice.finish_reason}. "
+                    "Check the Render logs for details."
                 )
 
             translated = clean_translation(content)
@@ -348,7 +364,10 @@ def translate_sentences(client, sentences, progress=None):
         if progress:
             progress(
                 (index + 1) / max(total, 1),
-                desc=f"Translating sentence {index + 1}/{total}"
+                desc=(
+                    f"Translating sentence "
+                    f"{index + 1}/{total}"
+                )
             )
 
     if len(translated) != len(sentences):
@@ -374,6 +393,7 @@ def get_task(task_id):
     )
 
     response.raise_for_status()
+
     return response.json()
 
 
@@ -420,12 +440,20 @@ def generate_hindi_audio(text, output_path):
     while time.time() < deadline:
         task = get_task(task_id)
 
-        status = str(task.get("status", "")).lower()
+        status = str(
+            task.get("status", "")
+        ).lower()
 
-        if status in ("error", "failed", "cancelled"):
+        if status in (
+            "error",
+            "failed",
+            "cancelled"
+        ):
             raise RuntimeError(
                 "AI33 voice generation failed: "
-                + str(task.get("error_message") or task)[:800]
+                + str(
+                    task.get("error_message") or task
+                )[:800]
             )
 
         metadata = task.get("metadata") or {}
@@ -463,14 +491,11 @@ def generate_hindi_audio(text, output_path):
 # AUDIO TIMELINE
 # =====================================================
 
-def build_dubbed_audio(sentences, english_duration, work_dir):
-    """
-    Generate one clip per translated sentence.
-    Fit clips to available time where possible.
-    Create a single sequential timeline, avoiding amix of
-    dozens of simultaneous inputs.
-    """
-
+def build_dubbed_audio(
+    sentences,
+    english_duration,
+    work_dir
+):
     pieces = []
     warnings = []
     previous_end = 0.0
@@ -502,7 +527,9 @@ def build_dubbed_audio(sentences, english_duration, work_dir):
             )
             continue
 
-        desired_start = float(sentence["start"])
+        desired_start = float(
+            sentence["start"]
+        )
 
         next_start = (
             float(sentences[index + 1]["start"])
@@ -523,12 +550,18 @@ def build_dubbed_audio(sentences, english_duration, work_dir):
         speed = 1.0
 
         if original_duration > available:
-            required_speed = original_duration / available
+            required_speed = (
+                original_duration / available
+            )
 
             if required_speed <= MAX_SPEED:
-                speed = max(MIN_SPEED, required_speed)
+                speed = max(
+                    MIN_SPEED,
+                    required_speed
+                )
             else:
                 speed = MAX_SPEED
+
                 warnings.append(
                     f"Sentence {index + 1}: Hindi speech exceeds "
                     "the available time window."
@@ -548,9 +581,14 @@ def build_dubbed_audio(sentences, english_duration, work_dir):
             processed_path
         ])
 
-        actual_duration = get_duration(processed_path)
+        actual_duration = get_duration(
+            processed_path
+        )
 
-        if target_start + actual_duration > english_duration:
+        if (
+            target_start + actual_duration
+            > english_duration
+        ):
             warnings.append(
                 f"Sentence {index + 1}: audio extends beyond "
                 "the English duration."
@@ -562,14 +600,15 @@ def build_dubbed_audio(sentences, english_duration, work_dir):
             "duration": actual_duration
         })
 
-        previous_end = target_start + actual_duration
+        previous_end = (
+            target_start + actual_duration
+        )
 
     if not pieces:
         raise RuntimeError(
             "No Hindi audio was successfully generated."
         )
 
-    # Build a timeline with silence gaps and one audio clip at a time.
     timeline_parts = []
     cursor = 0.0
 
@@ -597,19 +636,33 @@ def build_dubbed_audio(sentences, english_duration, work_dir):
             timeline_parts.append(silence_path)
             cursor = start
 
-        timeline_parts.append(piece["path"])
-        cursor = start + piece["duration"]
+        timeline_parts.append(
+            piece["path"]
+        )
 
-    # Create a concat manifest for FFmpeg.
+        cursor = (
+            start + piece["duration"]
+        )
+
     manifest_path = os.path.join(
         work_dir,
         "concat_list.txt"
     )
 
-    with open(manifest_path, "w", encoding="utf-8") as manifest:
+    with open(
+        manifest_path,
+        "w",
+        encoding="utf-8"
+    ) as manifest:
         for path in timeline_parts:
-            safe_path = os.path.abspath(path).replace("'", "'\\''")
-            manifest.write(f"file '{safe_path}'\n")
+            safe_path = (
+                os.path.abspath(path)
+                .replace("'", "'\\''")
+            )
+
+            manifest.write(
+                f"file '{safe_path}'\n"
+            )
 
     output_path = os.path.join(
         work_dir,
@@ -633,7 +686,10 @@ def build_dubbed_audio(sentences, english_duration, work_dir):
 # MAIN WORKFLOW
 # =====================================================
 
-def create_dubbing(english_audio, progress=gr.Progress()):
+def create_dubbing(
+    english_audio,
+    progress=gr.Progress()
+):
     if not GROQ_API_KEY:
         raise gr.Error(
             "GROQ_API_KEY is missing in Render Environment."
@@ -654,7 +710,10 @@ def create_dubbing(english_audio, progress=gr.Progress()):
     )
 
     try:
-        progress(0.03, desc="Preparing audio")
+        progress(
+            0.03,
+            desc="Preparing audio"
+        )
 
         prepared_audio = os.path.join(
             work_dir,
@@ -666,7 +725,9 @@ def create_dubbing(english_audio, progress=gr.Progress()):
             prepared_audio
         )
 
-        duration = get_duration(prepared_audio)
+        duration = get_duration(
+            prepared_audio
+        )
 
         size_mb = (
             os.path.getsize(prepared_audio)
@@ -679,16 +740,24 @@ def create_dubbing(english_audio, progress=gr.Progress()):
                 "Please upload a shorter or lower-bitrate audio."
             )
 
-        client = Groq(api_key=GROQ_API_KEY)
+        client = Groq(
+            api_key=GROQ_API_KEY
+        )
 
-        progress(0.10, desc="Transcribing English speech")
+        progress(
+            0.10,
+            desc="Transcribing English speech"
+        )
 
         english_segments = transcribe_english(
             client,
             prepared_audio
         )
 
-        progress(0.25, desc="Grouping sentences")
+        progress(
+            0.25,
+            desc="Grouping sentences"
+        )
 
         sentences = group_sentences(
             english_segments
@@ -699,14 +768,20 @@ def create_dubbing(english_audio, progress=gr.Progress()):
                 "No sentences were detected."
             )
 
-        progress(0.35, desc="Translating into Hinglish")
+        progress(
+            0.35,
+            desc="Translating into Hinglish"
+        )
 
         translated_sentences = translate_sentences(
             client,
             sentences
         )
 
-        progress(0.50, desc="Generating Hindi cloned voice")
+        progress(
+            0.50,
+            desc="Generating Hindi cloned voice"
+        )
 
         dubbed_path, warnings = build_dubbed_audio(
             translated_sentences,
@@ -714,35 +789,45 @@ def create_dubbing(english_audio, progress=gr.Progress()):
             work_dir
         )
 
-        progress(0.95, desc="Preparing download")
+        progress(
+            0.95,
+            desc="Preparing download"
+        )
 
-        final_duration = get_duration(dubbed_path)
+        final_duration = get_duration(
+            dubbed_path
+        )
 
-        status = (
+        status_text = (
             "Dubbing completed.\n\n"
             f"English duration: {duration:.2f} seconds\n"
             f"Dubbed duration: {final_duration:.2f} seconds\n"
-            f"English transcript segments: {len(english_segments)}\n"
-            f"Sentences translated: {len(translated_sentences)}\n"
-            f"Voice: MiniMax cloned voice\n"
+            f"English transcript segments: "
+            f"{len(english_segments)}\n"
+            f"Sentences translated: "
+            f"{len(translated_sentences)}\n"
             f"Voice ID: {VOICE_ID}\n"
-            f"Translation model: {GROQ_TRANSLATION_MODEL}\n"
+            f"Translation model: "
+            f"{GROQ_TRANSLATION_MODEL}\n"
         )
 
         if warnings:
-            status += (
+            status_text += (
                 "\nWarnings:\n- "
                 + "\n- ".join(warnings[:15])
             )
 
-        status += (
+        status_text += (
             "\n\nPlease listen to verify pronunciation, "
             "translation and synchronization."
         )
 
-        progress(1.0, desc="Finished")
+        progress(
+            1.0,
+            desc="Finished"
+        )
 
-        return dubbed_path, status
+        return dubbed_path, status_text
 
     except gr.Error:
         raise
@@ -755,7 +840,8 @@ def create_dubbing(english_audio, progress=gr.Progress()):
         )
 
         raise gr.Error(
-            "Dubbing failed: " + str(exc)[:1500]
+            "Dubbing failed: "
+            + str(exc)[:1500]
         )
 
 
@@ -807,11 +893,13 @@ Voice Generation → Timeline Synchronization
 
 
 if __name__ == "__main__":
-    app.queue(default_concurrency_limit=1)
+    app.queue(
+        default_concurrency_limit=1
+    )
 
     app.launch(
         server_name="0.0.0.0",
         server_port=int(
             os.environ.get("PORT", 10000)
         )
-    )
+)
